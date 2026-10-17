@@ -5,11 +5,14 @@ A super simple FastAPI application that allows students to view and sign up
 for extracurricular activities at Mergington High School.
 """
 
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import RedirectResponse
+from pydantic import BaseModel
 import os
 from pathlib import Path
+import secrets
+import time
 
 app = FastAPI(title="Mergington High School API",
               description="API for viewing and signing up for extracurricular activities")
@@ -18,6 +21,32 @@ app = FastAPI(title="Mergington High School API",
 current_dir = Path(__file__).parent
 app.mount("/static", StaticFiles(directory=os.path.join(Path(__file__).parent,
           "static")), name="static")
+
+STAFF_SESSION_COOKIE = "staff_session"
+STAFF_SESSION_MAX_AGE = 8 * 60 * 60
+staff_sessions: dict[str, float] = {}
+
+
+class StaffLogin(BaseModel):
+    username: str
+    password: str
+
+
+def staff_session_is_valid(request: Request) -> bool:
+    token = request.cookies.get(STAFF_SESSION_COOKIE)
+    expires_at = staff_sessions.get(token) if token else None
+    if expires_at is None:
+        return False
+    if expires_at <= time.time():
+        del staff_sessions[token]
+        return False
+    return True
+
+
+def require_staff(request: Request) -> None:
+    if not staff_session_is_valid(request):
+        raise HTTPException(status_code=401, detail="Staff login required")
+
 
 # In-memory activity database
 activities = {
@@ -88,8 +117,68 @@ def get_activities():
     return activities
 
 
+@app.get("/staff/session")
+def get_staff_session(request: Request):
+    return {"authenticated": staff_session_is_valid(request)}
+
+
+@app.post("/staff/login")
+def staff_login(credentials: StaffLogin, request: Request, response: Response):
+    username = os.environ.get("STAFF_USERNAME")
+    password = os.environ.get("STAFF_PASSWORD")
+    if not username or not password:
+        raise HTTPException(
+            status_code=503,
+            detail="Staff login is not configured on the server"
+        )
+
+    valid_username = secrets.compare_digest(
+        credentials.username.encode("utf-8"), username.encode("utf-8")
+    )
+    valid_password = secrets.compare_digest(
+        credentials.password.encode("utf-8"), password.encode("utf-8")
+    )
+    if not (valid_username and valid_password):
+        raise HTTPException(status_code=401, detail="Invalid username or password")
+
+    now = time.time()
+    for session_token, expires_at in list(staff_sessions.items()):
+        if expires_at <= now:
+            del staff_sessions[session_token]
+
+    token = secrets.token_urlsafe(32)
+    staff_sessions[token] = now + STAFF_SESSION_MAX_AGE
+    response.set_cookie(
+        key=STAFF_SESSION_COOKIE,
+        value=token,
+        max_age=STAFF_SESSION_MAX_AGE,
+        httponly=True,
+        secure=request.url.scheme == "https",
+        samesite="strict",
+        path="/",
+    )
+    return {"message": "Staff login successful"}
+
+
+@app.post("/staff/logout")
+def staff_logout(request: Request, response: Response):
+    token = request.cookies.get(STAFF_SESSION_COOKIE)
+    if token:
+        staff_sessions.pop(token, None)
+    response.delete_cookie(
+        key=STAFF_SESSION_COOKIE,
+        httponly=True,
+        secure=request.url.scheme == "https",
+        samesite="strict",
+        path="/",
+    )
+    return {"message": "Staff logout successful"}
+
+
 @app.post("/activities/{activity_name}/signup")
-def signup_for_activity(activity_name: str, email: str):
+def signup_for_activity(
+    activity_name: str, email: str, _: None = Depends(require_staff)
+):
     """Sign up a student for an activity"""
     # Validate activity exists
     if activity_name not in activities:
@@ -111,7 +200,9 @@ def signup_for_activity(activity_name: str, email: str):
 
 
 @app.delete("/activities/{activity_name}/unregister")
-def unregister_from_activity(activity_name: str, email: str):
+def unregister_from_activity(
+    activity_name: str, email: str, _: None = Depends(require_staff)
+):
     """Unregister a student from an activity"""
     # Validate activity exists
     if activity_name not in activities:
